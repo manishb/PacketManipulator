@@ -25,17 +25,17 @@ from threading import Thread
 from struct import pack, unpack
 from socket import gethostbyname, inet_aton, inet_ntoa
 
-from PM.Core.I18N import _
-from PM.Core.Logger import log
-from PM.Core.AuditUtils import is_ip, is_mac
-from PM.Core.Const import STATUS_ERR, STATUS_WARNING, STATUS_INFO
+from umit.pm.core.i18n import _
+from umit.pm.core.logger import log
+from umit.pm.core.auditutils import is_ip, is_mac
+from umit.pm.core.const import STATUS_ERR, STATUS_WARNING, STATUS_INFO
 
-from PM.Gui.Core.App import PMApp
-from PM.higwidgets.higdialogs import HIGAlertDialog
+from umit.pm.gui.core.app import PMApp
+from umit.pm.higwidgets.higdialogs import HIGAlertDialog
 
-from PM.Manager.AuditManager import *
+from umit.pm.manager.auditmanager import *
 
-from PM.Backend import MetaPacket
+from umit.pm.backend import MetaPacket
 
 AUDIT_NAME = 'arp-ping'
 AUDIT_MSG = '<tt><b>' + AUDIT_NAME + ':</b> %s</tt>'
@@ -233,6 +233,38 @@ class ARPPingOperation(AuditOperation):
         self.sender = None
         self.percentage = 100.0
 
+class ARPScan(ActiveAudit):
+    def start(self, reader):
+        a, self.item = self.add_menu_entry('ARPScan', 'Scan for hosts...',
+                                           _('Scan for hosts using ARP ping'),
+                                           gtk.STOCK_FIND)
+
+    def stop(self):
+        self.remove_menu_entry(self.item)
+
+    def execute_audit(self, sess, inp_dict):
+        if not self.ping_scan(sess,
+                              sess.context.get_iface1(),
+                              sess.context.get_ip1(),
+                              sess.context.get_netmask1()):
+            sess.output_page.user_msg(_('Could not perform an ARP scan.'),
+                                     STATUS_ERR, AUDIT_NAME)
+        else:
+            self.ping_scan(sess,
+                           sess.context.get_iface2(),
+                           sess.context.get_ip2(),
+                           sess.context.get_netmask2())
+
+    def ping_scan(self, sess, iface, ip, netmask):
+        if not iface or not ip or not netmask:
+            return False
+
+        sess.audit_page.tree.append_operation(
+            ARPScanOperation(sess, iface, ip, netmask)
+        )
+
+        return True
+
 class ARPPing(ActiveAudit):
     __inputs__ = (
         ('target', ('0.0.0.0', _('IP address or hostname of the target.'))),
@@ -242,13 +274,6 @@ class ARPPing(ActiveAudit):
     )
 
     def start(self, reader):
-        tab = PMApp().main_window.get_tab('HostListTab')
-
-        if tab:
-            # Register scan button of hostlisttab
-
-            tab.scan_cb = self.on_scan_cb
-
         a, self.item = self.add_menu_entry('ARPPing', 'ARP ping ...',
                                            _('Ping a target using ARP request'),
                                            gtk.STOCK_EXECUTE)
@@ -256,48 +281,12 @@ class ARPPing(ActiveAudit):
     def stop(self):
         self.remove_menu_entry(self.item)
 
-    def on_scan_cb(self):
-        tab = PMApp().main_window.get_tab('MainTab')
-        sess = tab.get_current_session()
-
-        if not sess or sess.session_name != 'AUDIT':
-            d = HIGAlertDialog(PMApp().main_window,
-                               gtk.DIALOG_MODAL,
-                               gtk.MESSAGE_ERROR,
-                               message_format=_('Unable to start a scan'),
-                               secondary_text=_('You should first select an '
-                                                'Audit session as current tab')
-            )
-            d.run()
-            d.hide()
-            d.destroy()
-
-            return
-
-        self.ping_scan(sess,
-                       sess.context.get_iface1(),
-                       sess.context.get_ip1(),
-                       sess.context.get_netmask1())
-
-        self.ping_scan(sess,
-                       sess.context.get_iface2(),
-                       sess.context.get_ip2(),
-                       sess.context.get_netmask2())
-
-    def ping_scan(self, sess, iface, ip, netmask):
-        if not iface or not ip or not netmask:
-            return
-
-        sess.audit_page.tree.append_operation(
-            ARPScanOperation(sess, iface, ip, netmask)
-        )
-
     def execute_audit(self, sess, inp_dict):
         target = inp_dict['target']
         probes = inp_dict['probes']
 
         if probes < 1 and probes != -1:
-            sess.ouput_page.user_msg(_('Probes could be -1 or > 0'), STATUS_ERR,
+            sess.output_page.user_msg(_('Probes could be -1 or > 0'), STATUS_ERR,
                                      AUDIT_NAME)
             return False
 
@@ -308,14 +297,14 @@ class ARPPing(ActiveAudit):
             sess.output_page.user_msg(_('Hostname %s solved as %s') \
                                       % (target, ip), STATUS_INFO, AUDIT_NAME)
         if ip == '0.0.0.0':
-            sess.ouput_page.user_msg(_('Not a valid target'), STATUS_ERR,
+            sess.output_page.user_msg(_('Not a valid target'), STATUS_ERR,
                                      AUDIT_NAME)
             return False
 
         return ARPPingOperation(sess, ip, max(inp_dict['delay'], 0),
                                 probes, inp_dict['report'])
 
-__plugins__ = [ARPPing]
+__plugins__ = [ARPPing, ARPScan]
 __plugins_deps__ = []
 
 __audit_type__ = 1

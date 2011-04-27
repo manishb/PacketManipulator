@@ -21,7 +21,7 @@
 """
 A traffic profiler and collector module.
 
->>> from PM.Core.AuditUtils import audit_unittest
+>>> from umit.pm.core.auditutils import audit_unittest
 >>> audit_unittest('-f ethernet,ip,tcp,ftp,profiler', 'ftp-login.pcap')
 MAC: 06:05:04:03:02:01 (UNKNW) IP: 127.0.0.1 1 service(s) (0 accounts for port 21)
 dissector.ftp.info FTP : 127.0.0.1:21 -> USER: anonymous PASS: guest@example.com
@@ -38,13 +38,15 @@ MAC: 06:05:04:03:02:01 (UNKNW) IP: 127.0.0.1 OS: Novell NetWare 3.12 - 5.00 (nea
 
 import os.path
 
-from PM.Core.I18N import _
-from PM.Gui.Core.App import PMApp
-from PM.Core.Atoms import defaultdict
-from PM.Gui.Plugins.Engine import Plugin
-from PM.Manager.AuditManager import *
+from umit.pm.core.i18n import _
+from umit.pm.gui.core.app import PMApp
+from umit.pm.core.atoms import defaultdict
+from umit.pm.gui.plugins.engine import Plugin
+from umit.pm.manager.auditmanager import *
 
-from PM.Core.Providers import AccountProvider, PortProvider, ProfileProvider, \
+from umit.pm.core.bus import unbind_function, implements
+from umit.pm.core.providers import AccountProvider, PortProvider, \
+     ProfileProvider, \
      UNKNOWN_TYPE, HOST_LOCAL_TYPE, HOST_NONLOCAL_TYPE, \
      GATEWAY_TYPE, ROUTER_TYPE
 
@@ -97,6 +99,7 @@ class Profile(ProfileProvider):
 
         return s[:-1]
 
+@implements('pm.hostlist')
 class Profiler(Plugin, PassiveAudit):
     def start(self, reader):
         # We see profile with l3_addr as key (IP address)
@@ -104,6 +107,9 @@ class Profiler(Plugin, PassiveAudit):
         self.profiles = defaultdict(list)
 
         conf = AuditManager().get_configuration('passive.profiler')
+
+        self.maxnum = max(conf['cleanup_hit'], 10)
+        self.keep_local = conf['keep_local']
 
         if conf['mac_fingerprint']:
             if reader:
@@ -130,23 +136,11 @@ class Profiler(Plugin, PassiveAudit):
 
         if reader:
             self.debug = False
-
-            hltab = PMApp().main_window.get_tab('HostListTab')
-
-            if hltab:
-                hltab.info_cb = self.info_cb
-                hltab.populate_cb = self.populate_cb
-
-                self.hltab = hltab
-            else:
-                self.hltab = None
         else:
             self.debug = True
 
+    @unbind_function('pm.hostlist', ('get', 'info', 'populate', 'get_target'))
     def stop(self):
-        if self.hltab:
-            self.hltab.info_cb = None
-            self.hltab.populate_cb = None
         try:
             manager.add_decoder_hook(PROTO_LAYER, NL_TYPE_TCP,
                                      self._parse_tcp, 1)
@@ -165,7 +159,7 @@ class Profiler(Plugin, PassiveAudit):
         except:
             pass
 
-    def info_cb(self, intf, ip, mac):
+    def __impl_info(self, intf, ip, mac):
         """
         @return a ProfileProvider object or None if not found
         """
@@ -174,7 +168,7 @@ class Profiler(Plugin, PassiveAudit):
             if prof.l2_addr == mac:
                 return prof
 
-    def populate_cb(self, interface):
+    def __impl_populate(self, interface):
         # This signal is triggered when the user change the interface
         # combobox selection and we have to repopulate the tree
 
@@ -189,9 +183,55 @@ class Profiler(Plugin, PassiveAudit):
 
         return ret
 
+    def __impl_get(self):
+        return self.profiles
+
+    def __impl_get_target(self, **kwargs):
+        ret = []
+        l2_addr, l3_addr, hostname, netmask = None, None, None, None
+
+        if 'l2_addr' in kwargs:
+            l2_addr = kwargs.pop('l2_addr')
+        if 'l3_addr' in kwargs:
+            l3_addr = kwargs.pop('l3_addr')
+        if 'hostname' in kwargs:
+            hostname = kwargs.pop('hostname')
+        if 'netmask' in kwargs:
+            netmask = kwargs.pop('netmask')
+
+        log.debug('Looking for a profile matching l2_addr=%s l3_addr=%s '
+                  'hostname=%s netmask=%s' % \
+                  (l2_addr, l3_addr, hostname, netmask))
+
+        check_validity = lambda prof: \
+               (not l2_addr or (l2_addr and prof.l2_addr == l2_addr)) and \
+               (not hostname or (hostname and prof.hostname == hostname))
+
+        if l3_addr:
+            if l3_addr not in self.profiles:
+                return None
+
+            for prof in self.profiles[l3_addr]:
+                if check_validity(prof):
+                    ret.append(prof)
+        else:
+            if netmask:
+                valid_ip = filter(netmask.match_strict, self.profiles.keys())
+            else:
+                valid_ip = self.profiles.keys()
+
+            for ip in valid_ip:
+                for prof in self.profiles[ip]:
+                    if check_validity(prof):
+                        ret.append(prof)
+
+        log.debug('Returning %s' % ret)
+        return ret
+
     def register_hooks(self):
         manager = AuditManager()
 
+        # TODO: also handle UDP when UDP dissectors will be ready.
         manager.add_decoder_hook(PROTO_LAYER, NL_TYPE_TCP,
                                  self._parse_tcp, 1)
 
@@ -202,9 +242,13 @@ class Profiler(Plugin, PassiveAudit):
                                  self._parse_icmp, 1)
 
     def _parse_tcp(self, mpkt):
-        sport = mpkt.get_field('tcp.sport')
-        dport = mpkt.get_field('tcp.dport')
-        tcpflags = mpkt.get_field('tcp.flags')
+        if mpkt.flags & MPKT_FORWARDED or \
+           mpkt.flags & MPKT_IGNORE:
+            return
+
+        sport = mpkt.l4_src
+        dport = mpkt.l4_dst
+        tcpflags = mpkt.l4_flags
 
         if not tcpflags:
             return
@@ -257,6 +301,13 @@ class Profiler(Plugin, PassiveAudit):
             print prof
 
     def _parse_arp(self, mpkt):
+        if mpkt.context:
+            mpkt.context.check_forwarded(mpkt)
+
+        if mpkt.flags & MPKT_FORWARDED or \
+           mpkt.flags & MPKT_IGNORE:
+            return
+
         prof = self.get_or_create(mpkt)
         prof.type = HOST_LOCAL_TYPE
         prof.distance = 1 # we are in LAN so distance is 1
@@ -265,6 +316,10 @@ class Profiler(Plugin, PassiveAudit):
         # and if equal set distance to 0
 
     def _parse_icmp(self, mpkt):
+        if mpkt.flags & MPKT_FORWARDED or \
+           mpkt.flags & MPKT_IGNORE:
+            return
+
         prof = self.get_or_create(mpkt)
 
         icmp_type = mpkt.get_field('icmp.type')
@@ -282,13 +337,54 @@ class Profiler(Plugin, PassiveAudit):
 
             prof.type = ROUTER_TYPE
 
-    def get_or_create(self, mpkt, clientside=False):
-        if not clientside:
-            ip = mpkt.get_field('ip.src')
-            mac = mpkt.get_field('eth.src')
+    def cleanup(self):
+        # Yes this is really a mess. But it is for performance :)
+        log.info('Cleaning up all collected profiles')
+
+        if self.keep_local:
+            not_interesting = lambda p: p.type != HOST_LOCAL_TYPE
         else:
-            ip = mpkt.get_field('ip.dst')
-            mac = mpkt.get_field('eth.dst')
+            not_interesting = lambda p: True
+
+        ipidx = 0
+        ips = self.profiles.keys()
+
+        while ipidx < len(ips):
+            ipkey = ips[ipidx]
+            profiles = self.profiles[ipkey]
+
+            profidx = 0
+            proflen = len(profiles)
+
+            while profidx < proflen:
+                profile = profiles[profidx]
+
+                if not_interesting(profile):
+                    if profile.fingerprint or profile.ports:
+                        AuditManager().user_msg(str(profile), 6, 'profiler')
+
+                    # Delete the profile
+                    profile = None
+                    del profiles[profidx]
+                    proflen -= 1
+                else:
+                    profidx += 1
+
+            if not profiles:
+                del self.profiles[ipkey]
+
+            ipidx += 1
+
+    def get_or_create(self, mpkt, clientside=False):
+        if len(self.profiles) >= self.maxnum:
+            self.cleanup()
+
+        if not clientside:
+            ip = mpkt.l3_src
+            mac = mpkt.l2_src
+        else:
+            ip = mpkt.l3_dst
+            mac = mpkt.l2_dst
 
         for prof in self.profiles[ip]:
             if not mac:
@@ -311,11 +407,16 @@ class Profiler(Plugin, PassiveAudit):
             return prof
 
 __plugins__ = [Profiler]
-__plugins_deps__ = [('Profiler', [], ['=Profiler-1.0'], [])]
+__plugins_deps__ = [('Profiler', ['=TCPDecoder-1.0'], ['=Profiler-1.0'], [])]
 
 __audit_type__ = 0
 __protocols__ = (('icmp', None), ('eth', None))
 __configurations__ = (('passive.profiler', {
     'mac_fingerprint' : [True, 'Enable MAC lookup into DB to report NIC '
-                         'vendor']}),
+                         'vendor'],
+    'keep_local' : [True, 'Keep only reserved addresses (127./172./10.)'],
+    'cleanup_hit' : [60, 'Purge local cache after cleanup_timeout seconds.' \
+                     'All sensible information will be printed before real '
+                     'deletion. Values should be >= 10'],
+    }),
 )

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Copyright (C) 2008 Adriano Monteiro Marques
+# Copyright (C) 2008, 2009 Adriano Monteiro Marques
 #
 # Author: Francesco Piccinno <stack.box@gmail.com>
 #
@@ -23,13 +23,13 @@ import sys
 
 from collections import defaultdict
 
-from PM.Core.Logger import log
-from PM.Backend import TimedContext
+from umit.pm.core.logger import log
+from umit.pm.backend import TimedContext
 
-from PM.Gui.Core.App import PMApp
-from PM.Gui.Core.Views import UmitView
-from PM.Gui.Plugins.Engine import Plugin
-from PM.Gui.Sessions.SniffSession import SniffSession
+from umit.pm.gui.core.app import PMApp
+from umit.pm.gui.core.views import UmitView
+from umit.pm.gui.plugins.engine import Plugin
+from umit.pm.gui.sessions.sniffsession import SniffSession
 
 _ = str
 
@@ -48,8 +48,6 @@ class GeoTab(UmitView):
     def create_ui(self):
         self.locator = GeoIP.new(GeoIP.GEOIP_MEMORY_CACHE)
 
-        vbox = gtk.VBox(False, 2)
-
         sw = gtk.ScrolledWindow()
         sw.set_policy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
         sw.set_shadow_type(gtk.SHADOW_ETCHED_IN)
@@ -66,18 +64,16 @@ class GeoTab(UmitView):
         btn = gtk.Button(stock=gtk.STOCK_REFRESH)
         btn.connect('clicked', self.__on_refresh)
 
-        vbox.pack_start(sw)
-        vbox.pack_start(btn, False, False)
-
-        self._main_widget.add(vbox)
+        self._main_widget.pack_start(sw)
+        self._main_widget.pack_end(btn, False, False)
         self._main_widget.show_all()
 
         tab = PMApp().main_window.get_tab("MainTab")
         tab.session_notebook.connect('switch-page', self.__on_switch_page)
 
     def __on_refresh(self, btn):
-        tab = PMApp().main_window.get_tab("MainTab")
-        self.__load_session(tab.session_notebook.get_current_session())
+        self.__load_session(PMApp().bus.call('pm.sessions',
+                                             'get_current_session'))
 
     def __on_switch_page(self, sess_nb, page, num):
         self.__load_session(sess_nb.get_nth_page(num))
@@ -119,11 +115,12 @@ class GeoTab(UmitView):
 
 class GeoStats(Plugin):
     def start(self, reader):
-        catalog = reader.bind_translation("geostats")
+        if reader:
+            catalog = reader.bind_translation("geostats")
 
-        if catalog:
-            global _
-            _ = catalog.gettext
+            if catalog:
+                global _
+                _ = catalog.gettext
 
         self.geo_tab = GeoTab()
         PMApp().main_window.register_tab(self.geo_tab, True)

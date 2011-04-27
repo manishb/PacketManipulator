@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Copyright (C) 2008 Adriano Monteiro Marques
+# Copyright (C) 2008, 2009 Adriano Monteiro Marques
 #
 # Author: Francesco Piccinno <stack.box@gmail.com>
 #
@@ -29,19 +29,19 @@ from libtrace import tracert
 
 from threading import Thread
 
-from PM.Backend import StaticContext, traceroute
-from PM.Core.Logger import log
-from PM.Core.Atoms import generate_traceback
+from umit.pm.backend import StaticContext, traceroute
+from umit.pm.core.logger import log
+from umit.pm.core.atoms import generate_traceback
 
-from PM.Gui.Core.App import PMApp
-from PM.Gui.Plugins.Engine import Plugin
-from PM.Gui.Sessions.Base import Session
+from umit.pm.gui.core.app import PMApp
+from umit.pm.gui.plugins.engine import Plugin
+from umit.pm.gui.sessions.base import Session
 
-from PM.Gui.Sessions import SessionType
-from PM.Gui.Pages.Base import Perspective
+from umit.pm.gui.sessions import SessionType
+from umit.pm.gui.pages.base import Perspective
 
-from PM.Core.Errors import PMErrorException
-from PM.Manager.PreferenceManager import Prefs
+from umit.pm.core.errors import PMErrorException
+from umit.pm.manager.preferencemanager import Prefs
 
 try:
     import webkit
@@ -65,7 +65,7 @@ class Traceroute(Perspective):
     def create_ui(self):
         self.toolbar = gtk.Toolbar()
         self.toolbar.set_style(gtk.TOOLBAR_ICONS)
-        
+
         # Entry / dport / maxttl / timeout
         self.target = gtk.Entry()
         self.dport = gtk.SpinButton(gtk.Adjustment(80, 1, 65535, 1, 1))
@@ -167,7 +167,7 @@ class Traceroute(Perspective):
 
         if ret is None or len(ret) != 2 or not isinstance(ret, list):
             return
-        
+
         if ret[0] is None and isinstance(ret[1], Exception):
             self.store.clear()
             self.store.append([0, str(ret[1]), ""])
@@ -192,7 +192,7 @@ class TracerouteMap(Perspective):
 
         self.ready = True
         self.html_map = ""
-        
+
         sw = gtk.ScrolledWindow()
         sw.set_policy(gtk.POLICY_AUTOMATIC, gtk.POLICY_AUTOMATIC)
         sw.set_shadow_type(gtk.SHADOW_ETCHED_IN)
@@ -267,25 +267,24 @@ class TracerouteContext(StaticContext):
     def unlock(self):
         if callable(self.unlock_callback):
             self.unlock_callback()
-    
+
 class TracerouteSession(Session):
     session_name = "TRACEROUTE"
     session_menu = "Traceroute"
-    session_orientation = gtk.ORIENTATION_HORIZONTAL
+    session_orientation = [gtk.ORIENTATION_HORIZONTAL]
 
     def create_ui(self):
-        self.trace_page = self.add_perspective(Traceroute, True,
-                                               True, False)
-        self.map_page = self.add_perspective(TracerouteMap, False,
-                                             True, False)
+        self.trace_page = self.add_perspective(Traceroute, True, True)
+        self.map_page = self.add_perspective(TracerouteMap, False, True)
 
-        self.reload()
-        self.pack_start(self.paned)
-        self.show_all()
+        self.editor_cbs.append(self.reload_editor)
+        self.container_cbs.append(self.reload_container)
+
+        super(TracerouteSession, self).create_ui()
 
     def reload_editor(self):
         self.map_page.create_map()
-    
+
     def reload_container(self, packet=None):
         self.trace_page.populate()
 

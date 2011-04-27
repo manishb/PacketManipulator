@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-# Copyright (C) 2008 Adriano Monteiro Marques
+# Copyright (C) 2008, 2010 Adriano Monteiro Marques
 #
 # Author: Francesco Piccinno <stack.box@gmail.com>
 #
@@ -19,9 +19,9 @@
 # Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
 """
-TCP protocol dissector
+TCP protocol decoder
 
->>> from PM.Core.AuditUtils import audit_unittest
+>>> from umit.pm.core.auditutils import audit_unittest
 >>> audit_unittest('-f ethernet,ip,tcp', 'wrong-checksum.pcap')
 decoder.ip.notice Invalid IP packet from 127.0.0.1 to 127.0.0.1 : wrong checksum 0xdead instead of 0x7bce
 decoder.tcp.notice Invalid TCP packet from 127.0.0.1 to 127.0.0.1 : wrong checksum 0x29a instead of 0xc86
@@ -31,17 +31,18 @@ from datetime import datetime
 from struct import pack, unpack
 from socket import inet_aton, ntohl, inet_ntoa
 
-from PM.Core.I18N import _
-from PM.Core.Logger import log
-from PM.Core.Tracing import trace
-from PM.Gui.Plugins.Core import Core
-from PM.Core.Atoms import defaultdict
-from PM.Gui.Plugins.Engine import Plugin
-from PM.Manager.AuditManager import AuditManager, PassiveAudit
-from PM.Core.NetConst import *
-from PM.Core.AuditUtils import checksum
+from umit.pm.core.i18n import _
+from umit.pm.core.logger import log
+from umit.pm.core.tracing import trace
+from umit.pm.gui.plugins.core import Core
+from umit.pm.core.atoms import defaultdict
+from umit.pm.gui.plugins.engine import Plugin
+from umit.pm.manager.sessionmanager import *
+from umit.pm.manager.auditmanager import AuditManager, PassiveAudit
+from umit.pm.core.netconst import *
+from umit.pm.core.auditutils import checksum
 
-from PM.Backend import MetaPacket
+from umit.pm.backend import MetaPacket
 
 TCP_ESTABLISHED = 1
 TCP_SYN_SENT    = 2
@@ -98,13 +99,12 @@ class Buffer(object):
         self.fin = 0
         self.urg = 0
         self.seq = 0
-        self.ack = 0
 
         self.prev, self.next = None, None
 
     def __repr__(self):
-        return '<Buffer %.10s seq=%d ack=%d fin=%d>' \
-               % (self.data, self.seq, self.ack, self.fin)
+        return '<Buffer %.10s seq=%d fin=%d>' \
+               % (repr(self.data), self.seq, self.fin)
 
     def dump(self):
         """
@@ -124,7 +124,6 @@ class HalfStream(object):
         self.seq = 0
         self.first_data_seq = 0
         self.ack_seq = 0
-        self.seq_adj = 0 # For injection
         self.window = 0
 
         self.ts_on = 0
@@ -145,8 +144,8 @@ class HalfStream(object):
         self.plist_tail = None
 
     def __repr__(self):
-        return '<HalfStream(to=%s) seq=%d ack=%d adj=%d data=%.10s>' \
-               % (self.name, self.seq, self.ack_seq, self.seq_adj, self.data)
+        return '<HalfStream(to=%s) seq=%d ack=%d data=%.10s>' \
+               % (self.name, self.seq, self.ack_seq, self.data)
 
 class TCPStream(object):
     def __init__(self, source, dest, sport, dport):
@@ -179,9 +178,9 @@ class TCPStream(object):
         "@return the bytes collected of the session"
         return self.client.count + self.server.count
 
-    def __hash__(self):
-        return hash(self.source) ^ hash(self.sport) ^ \
-               hash(self.dest) ^ hash(self.dport)
+    def mkhash(self):
+        return hash(self.source) ^ hash(self.dest) ^ \
+               hash(self.sport ^ self.dport)
 
     def __repr__(self):
         return '%s:%d <-> %s:%d' % (
@@ -240,8 +239,8 @@ class Reassembler(object):
 
         if iplen < 20:
             return
-        ipsrc, ipdst = inet_aton(mpkt.get_field('ip.src')), \
-                       inet_aton(mpkt.get_field('ip.dst'))
+        ipsrc, ipdst = inet_aton(mpkt.l3_src), \
+                       inet_aton(mpkt.l3_dst)
 
         # Proto or port unreach
         if mpkt.get_field('ip.code') in (2, 3) and \
@@ -278,22 +277,21 @@ class Reassembler(object):
         """
 
         datalen = mpkt.get_field('ip.len') - \
-                  4 * mpkt.get_field('ip.ihl') - \
-                  4 * (mpkt.get_field('tcp.dataofs') or 0)
+                  mpkt.l3_len - mpkt.l4_len
 
         if datalen < 0:
             log.warning('Bogus TCP/IP header (datalen < 0)')
             return
 
-        ipsrc, ipdst = inet_aton(mpkt.get_field('ip.src')),\
-                       inet_aton(mpkt.get_field('ip.dst'))
+        ipsrc, ipdst = inet_aton(mpkt.l3_src), \
+                       inet_aton(mpkt.l3_dst)
 
         if ipsrc == '\x00\x00\x00\x00' and \
            ipdst == '\x00\x00\x00\x00':
             log.warning('Bogus IP header (src or dst are NULL)')
             return
 
-        tcpflags = mpkt.get_field('tcp.flags')
+        tcpflags = mpkt.l4_flags
 
         if not tcpflags:
             return
@@ -313,8 +311,8 @@ class Reassembler(object):
         else:
             snd, rcv = stream.server, stream.client
 
-        tcpseq = mpkt.get_field('tcp.seq')
-        tcpack = mpkt.get_field('tcp.ack')
+        tcpseq = mpkt.l4_seq or 0
+        tcpack = mpkt.l4_ack or 0
 
         if tcpflags & TH_SYN:
             if is_client or stream.client.state != TCP_SYN_SENT or \
@@ -328,7 +326,7 @@ class Reassembler(object):
             stream.server.seq = \
             stream.server.first_data_seq = tcpseq + 1
             stream.server.ack_seq = tcpack
-            stream.server.window = mpkt.get_field('tcp.window')
+            stream.server.window = mpkt.get_field('tcp.window', 0)
 
             if stream.client.ts_on:
                 stream.server.ts_on, stream.server.curr_ts = get_ts(mpkt)
@@ -349,12 +347,10 @@ class Reassembler(object):
                 stream.server.wscale_on = 0
                 stream.server.wscale = 1
 
-        if not (not datalen and tcpseq == (rcv.ack_seq)) and \
-           (not (tcpseq - (rcv.ack_seq + rcv.window * rcv.wscale) <= 0) or \
-            (tcpseq + datalen) - rcv.ack_seq < 0):
-            #print "*" * 80
-            #print mpkt.get_field('raw.load')
-            #print "*" * 80
+        #if not (not datalen and tcpseq == (rcv.ack_seq)) and \
+        #   (not (tcpseq - (rcv.ack_seq + rcv.window * rcv.wscale) < 0) or \
+        #   (tcpseq + datalen) - rcv.ack_seq < 0):
+        if tcpseq + datalen - rcv.ack_seq < 0:
             return
 
         if tcpflags & TH_RST:
@@ -391,23 +387,8 @@ class Reassembler(object):
                     stream.state = CONN_DATA
 
         if tcpflags & TH_ACK:
-            log.debug('ACK recvd -> CACK: %d OACK: %d ADJ: %d' % \
-                      (tcpack, snd.ack_seq, rcv.seq_adj))
-
             if tcpack - snd.ack_seq > 0:
-                snd.ack_seq = tcpack# + rcv.seq_adj
-                print snd
-
-            # Handle ACK packets
-            if rcv.state == TCP_ESTABLISHED and not datalen and \
-               (rcv.seq_adj != 0 or snd.seq_adj != 0):
-
-                mpkt.set_cfield('inj::l4proto', NL_TYPE_TCP)
-                mpkt.set_cfield('inj::data', (stream, rcv))
-                mpkt.set_cfield('inj::flags', INJ_MODIFIED)
-
-                log.debug('Fixing ACK packet')
-
+                snd.ack_seq = tcpack
             if rcv.state == FIN_SENT:
                 rcv.state = FIN_CONFIRMED
             if rcv.state == FIN_CONFIRMED and snd.state == FIN_CONFIRMED:
@@ -420,16 +401,17 @@ class Reassembler(object):
                 return
 
         if (datalen + (tcpflags & TH_FIN)) > 0:
-            payload = mpkt.get_field('tcp')[mpkt.get_field('tcp.dataofs') * 4:]
+            payload = mpkt.data
 
             if payload:
                 self.tcp_queue(stream, mpkt, snd, rcv, payload, datalen)
 
-        snd.window = mpkt.get_field('tcp.window')
+        snd.window = mpkt.get_field('tcp.window', 0)
 
         if rcv.rmem_alloc > 65535:
             self.prune_queue(rcv)
 
+    #@trace
     def prune_queue(self, rcv):
         """
         Prune a pending queue by freeing all the data
@@ -455,46 +437,23 @@ class Reassembler(object):
         rcv.count += rcv.count_new
 
     def notify(self, mpkt, stream, rcv):
-        ret = INJ_SKIP_PACKET
+        ret = REAS_SKIP_PACKET
 
         for listener in stream.listeners:
             ret = max(ret,
                       listener(stream, mpkt, rcv))
 
-            if ret == INJ_MODIFIED or ret == INJ_FORWARD:
-
-                if ret == INJ_MODIFIED:
-                    mpkt.set_cfield('inj::l4proto', NL_TYPE_TCP)
-                    mpkt.set_cfield('inj::data', (stream, rcv))
-
-                mpkt.set_cfield('inj::flags', ret)
-                return
-
-        if ret == INJ_COLLECT_STATS:
+        if ret == REAS_COLLECT_STATS:
             log.debug('Collecting stats')
             rcv.data = ''
-        elif ret == INJ_SKIP_PACKET:
+        elif ret == REAS_SKIP_PACKET:
             log.debug('Skipping packet')
             rcv.count_new = 0
             rcv.data = ''
         else:
             log.debug('Collecting data')
-            pass
 
-        if rcv.seq_adj != 0:
-            # Ok this stream is a child of a previous injection so
-            # we have to modify the seq and ack to respect the flow
-
-            mpkt.set_cfield('inj::l4proto', NL_TYPE_TCP)
-            mpkt.set_cfield('inj::data', (stream, rcv))
-            mpkt.set_cfield('inj::flags', INJ_MODIFIED)
-
-            log.debug('Adjusting seq and ack')
-
-        #print inet_ntoa(stream.source), stream.sport, \
-        #      inet_ntoa(stream.dest), stream.dport
-
-    @trace
+    #@trace
     def add_from_skb(self, stream, mpkt, rcv, snd, payload, datalen, tcpseq, \
                      fin, urg, urg_ptr):
 
@@ -557,7 +516,7 @@ class Reassembler(object):
             if rcv.state == TCP_CLOSE:
                 self.add_tcp_closing_timeout(stream)
 
-    @trace
+    #@trace
     def tcp_queue(self, stream, mpkt, snd, rcv, payload, datalen):
         """
         Append a packet to a tcp queue
@@ -568,20 +527,12 @@ class Reassembler(object):
         @param payload the payload of the tcp packet as str
         @param datalen the datalen
         """
-        tcpseq = mpkt.get_field('tcp.seq')
-        tcpflags = mpkt.get_field('tcp.flags')
+        tcpseq = mpkt.l4_seq
+        tcpflags = mpkt.l4_flags
 
         exp_seq = (snd.first_data_seq + rcv.count + rcv.urg_count)
 
-        log.debug('Original TCP sequence: %d seq_adj: %d exp_seq: %d' \
-                  % (tcpseq, rcv.seq_adj, exp_seq))
-
-        #if tcpseq != exp_seq:# and tcpseq + rcv.seq_adj == exp_seq:
-        #    log.debug('Current TCP sequence adjusted to exp_seq (+ seq_adj)')
-        #    tcpseq += rcv.seq_adj
-
         if not tcpseq - exp_seq > 0:
-            log.debug('Before data')
 
             # This packet is old because seq < current
             if (tcpseq + datalen + (tcpflags & TH_FIN)) - exp_seq > 0:
@@ -642,7 +593,7 @@ class Reassembler(object):
 
             packet.seq = tcpseq
             packet.urg = tcpflags & TH_URG
-            packet.urg_ptr = mpkt.get_field('tcp.urgptr')
+            packet.urg_ptr = mpkt.get_field('tcp.urgptr', 0)
 
             while True:
                 if not p or not p.seq - tcpseq > 0:
@@ -674,17 +625,17 @@ class Reassembler(object):
                 else:
                     rcv.plist_tail = packet
 
-            log.debug('List: %s' % rcv.plist.dump())
+            #log.debug('List: %s' % rcv.plist.dump())
 
     def add_new_tcp(self, mpkt):
         """
         @param mpkt a MetaPacket object
         """
-        ctup = (inet_aton(mpkt.get_field('ip.src')),
-                inet_aton(mpkt.get_field('ip.dst')),
-                mpkt.get_field('tcp.sport'), mpkt.get_field('tcp.dport'))
+        ctup = (inet_aton(mpkt.l3_src),
+                inet_aton(mpkt.l3_dst),
+                mpkt.l4_src, mpkt.l4_dst)
 
-        hash_idx = ':'.join(ctup[0:2])
+        hash_idx = hash(ctup[0]) ^ hash(ctup[1]) ^ hash(ctup[2] ^ ctup[3])
 
         if self.n_streams >= self.max_streams:
             orig_client_state = self.oldest_stream.client.state
@@ -712,8 +663,8 @@ class Reassembler(object):
 
         new_stream.client.state = TCP_SYN_SENT
         new_stream.client.seq = \
-        new_stream.client.first_data_seq = mpkt.get_field('tcp.seq') + 1
-        new_stream.client.window = mpkt.get_field('tcp.window')
+        new_stream.client.first_data_seq = mpkt.l4_seq + 1
+        new_stream.client.window = mpkt.get_field('tcp.window', 0)
 
         new_stream.client.ts_on, new_stream.client.curr_ts = get_ts(mpkt)
         new_stream.client.wscale_on, new_stream.client.wscale = get_wscale(mpkt)
@@ -742,9 +693,9 @@ class Reassembler(object):
         """
         # First look for client side streams
 
-        ctup = (inet_aton(mpkt.get_field('ip.src')),
-                inet_aton(mpkt.get_field('ip.dst')),
-                mpkt.get_field('tcp.sport'), mpkt.get_field('tcp.dport'))
+        ctup = (inet_aton(mpkt.l3_src),
+                inet_aton(mpkt.l3_dst),
+                mpkt.l4_src, mpkt.l4_dst)
 
         tcp_stream = self.find_tcp_stream(ctup)
 
@@ -765,7 +716,10 @@ class Reassembler(object):
         @param tup a tuple (srcip, dstip, srport, dport)
         @return a TCPStream or None
         """
-        it = self.tcp_streams.get(':'.join(tup[0:2]), None)
+        hash_idx = hash(tup[0]) ^ hash(tup[1]) ^ \
+                   hash(tup[2] ^ tup[3])
+
+        it = self.tcp_streams.get(hash_idx, None)
 
         while it:
             if it.sport == tup[2] and it.dport == tup[3]:
@@ -836,12 +790,12 @@ class Reassembler(object):
         """
         @param stream TCPStream instance
         """
+        hash_idx = stream.mkhash()
+
         self.del_tcp_closing_timeout(stream)
 
         self.prune_queue(stream.server)
         self.prune_queue(stream.client)
-
-        hash_idx = stream.source + ":" + stream.dest
 
         if stream.next_node:
             stream.next_node.prev_node = stream.prev_node
@@ -878,7 +832,6 @@ class Reassembler(object):
 class TCPDecoder(Plugin, PassiveAudit):
     def start(self, reader):
         self.checksum_check = True
-        self.dissectors = True
         self.reassembler = None
         self.manager = None
 
@@ -898,200 +851,185 @@ class TCPDecoder(Plugin, PassiveAudit):
         conf = self.manager.get_configuration('decoder.tcp')
 
         self.checksum_check = conf['checksum_check']
-        self.dissectors = conf['enable_dissectors']
 
         self.manager.add_decoder(PROTO_LAYER, NL_TYPE_TCP, self._process_tcp)
+        self.manager.add_injector(1, NL_TYPE_TCP, self._inject_tcp)
 
         if conf['enable_reassemble']:
             self.reassembler = Reassembler(conf['reassemble_workarounds'],
                                            conf['reassemble_maxstreams'])
             self.manager.add_decoder_hook(PROTO_LAYER, NL_TYPE_ICMP,
                                           self.reassembler.process_icmp, 1)
-            self.manager.add_injector(1, NL_TYPE_TCP, self._inject_tcp)
 
-    def _inject_tcp(self, context, mpkt):
+    def _inject_tcp(self, context, mpkt, length):
         """
         Function that manages injection of fragments in active TCP connection
         """
 
-        ret = INJ_FORWARD
-        stream, orcv = mpkt.cfields.get('inj::data', (None, None))
+        ident = TCPIdent.create(mpkt)
+        sess = SessionManager().get_session(ident)
 
-        if not stream:
-            log.debug('Last packet of the chain. Exiting')
-            return INJ_FORWARD
+        if not sess:
+            log.debug("No TCP session found.")
+            return False, length
 
-        rcv = (stream.client is orcv) and (stream.server) or (stream.client)
-
-        if not stream:
-            raise Exception('inj::data key not present')
-
-        if stream.state == CONN_UNDEFINED:
-            log.error('The data can\'t be injected in a UNDEFINED stream')
-            return INJ_ERROR
-
-        injector = AuditManager().get_injector(0, LL_TYPE_IP)
-
-        if injector(context, mpkt) == INJ_ERROR:
-            log.error('Error in underlayer injector')
-            return INJ_ERROR
-
-        payload = mpkt.cfields.get('inj::payload', None)
-
-        if not payload:
-            # Here we have only to adjust the sequence
-            # or check for dropped packet. If flags is dropped just increase
-            # the seq_adj and return True
-
-            if mpkt.get_field('tcp.seq') == rcv.seq + rcv.seq_adj:
-                log.debug('This is the injected packet skipping it')
-
-                ret = INJ_SKIP_PACKET
-                mpkt.unset_cfield('inj::data')
-
-            else:
-                cseq = mpkt.get_field('tcp.seq')
-                cack = mpkt.get_field('tcp.ack')
-
-                log.debug('Adjusting sequence for TCP packet')
-                log.debug('TCP sequence %d + %d = %d', cseq, rcv.seq_adj,
-                          rcv.seq_adj + cseq)
-                log.debug('TCP ack %d - %d = %d', cack, orcv.seq_adj,
-                          cack - orcv.seq_adj)
-                log.debug('Resetting TCP checksum')
-
-                mpkt.set_field('tcp.seq', cseq + rcv.seq_adj)
-                mpkt.set_field('tcp.ack', cack - orcv.seq_adj)
-                mpkt.reset_field('tcp.chksum')
-                mpkt.unset_cfield('inj::data')
-
+        if ident.l3_src == sess.ident.l3_src:
+            status = sess.data[1]
+            ostatus = sess.data[0]
         else:
+            status = sess.data[0]
+            ostatus = sess.data[1]
 
-            if rcv.seq_adj == 0 and orcv.seq_adj == 0:
+        mpkt.set_fields('tcp', {
+            'sport' : mpkt.l4_src,
+            'dport' : mpkt.l4_dst,
+            'dataofs' : 5,
+            'chksum' : None,
+            'urgptr' : 0,
+            'flags' : TH_PSH,
+            'options' : {}})
 
-                ret = INJ_SKIP_PACKET
-                log.error('The packet seems to be OK as is. '
-                          'This is the first packet')
+        if status.injectable & INJ_FIN or \
+           not status.injectable & INJ_FWD or \
+           not ostatus.injectable & INJ_FWD:
+            log.debug("Session is not injectable.")
+            return False, length
 
-            elif mpkt.get_field('tcp.seq') == rcv.seq + rcv.seq_adj:
+        mpkt.set_fields('tcp', {
+            'seq' : status.last_seq + status.seq_adj,
+            'ack' : status.last_ack - ostatus.seq_adj})
 
-                ret = INJ_SKIP_PACKET
-                log.debug('No adjustments needed. SEQ & ACK are ok')
+        if status.last_ack != 0:
+            mpkt.set_field('tcp.flags', mpkt.l4_flags | TH_ACK)
 
-            else:
-                cseq = mpkt.get_field('tcp.seq')
-                cack = mpkt.get_field('tcp.ack')
+        mpkt.session = sess.prev
+        length += 20 + mpkt.l2_len
 
-                log.debug('Adjusting current TCP packet')
-                log.debug('TCP sequence %d + %d = %d', cseq, rcv.seq_adj,
-                          rcv.seq_adj + cseq)
-                log.debug('TCP ack %d - %d = %d', cack, orcv.seq_adj,
-                          cack - orcv.seq_adj)
-                log.debug('Resetting TCP checksum')
+        injector = AuditManager().get_injector(0, mpkt.session.ident.magic)
+        is_ok, length = injector(context, mpkt, length)
 
-                mpkt.set_field('tcp.seq', cseq + rcv.seq_adj)
-                mpkt.set_field('tcp.ack', cack - orcv.seq_adj)
-                mpkt.reset_field('tcp.chksum')
+        if not is_ok:
+            return is_ok, length
 
-            plen = len(payload)
-            pkt = mpkt.cfields.get('inj::data', None)
+        length = context.get_mtu() - length
 
-            if not pkt:
-                log.error('The underlayer injector returns None as mpkt')
-                return INJ_ERROR
+        if length > mpkt.inject_len:
+            length = mpkt.inject_len
 
-            mtu = context.get_mtu() - pkt.get_size()
+        payload = mpkt.inject[:length]
+        payload_pkt = MetaPacket.new('raw')
+        payload_pkt.set_field('raw.load', payload)
+        mpkt.add_to('tcp', payload_pkt)
 
-            if plen > mtu:
-                plen = mtu
+        status.seq_adj += length
+        mpkt.data_len = length
 
-            prev_len = len(mpkt.get_field('tcp')) - \
-                     mpkt.get_field('tcp.dataofs') * 4
-
-            nseq = mpkt.get_field('tcp.seq') + prev_len
-            nack = mpkt.get_field('tcp.ack')
-
-            pkt = pkt / MetaPacket.new('tcp') / MetaPacket.new('raw')
-            pkt.set_field('tcp.sport', mpkt.get_field('tcp.sport'))
-            pkt.set_field('tcp.dport', mpkt.get_field('tcp.dport'))
-            pkt.set_field('tcp.flags', TH_PSH)
-            pkt.set_field('tcp.seq', nseq)
-            pkt.set_field('tcp.ack', nack)
-
-            log.debug('Forging new TCP + Raw packet (appended to %s)' % pkt)
-            log.debug('TCP seq: %d' % nseq)
-            log.debug('TCP ack: %d' % nack)
-
-            if rcv.ack_seq != 0:
-                pkt.set_field('tcp.flags', TH_PSH | TH_ACK)
-
-            pkt.set_field('raw.load', payload[:plen])
-
-            remaining = payload[plen:]
-
-            # Adjusting seq_adj
-            cur_len = len(mpkt.get_field('tcp')) - \
-                     mpkt.get_field('tcp.dataofs') * 4
-
-            rcv.seq_adj += cur_len
-
-            log.debug('Current packet has a payload with length = %d. '
-                      'seq_adj become: %d' % (cur_len, rcv.seq_adj))
-
-
-            if remaining:
-                pkt.set_cfield('inj::data', (stream, orcv))
-                pkt.set_cfield('inj::payload', remaining)
-
-            mpkt.set_cfield('inj::data', pkt)
-            mpkt.unset_cfield('inj::payload')
-
-        mpkt.unset_cfield('inj::flags')
-        mpkt.unset_cfield('inj::l4proto')
-
-        return ret
+        return True, length
 
     def _process_tcp(self, mpkt):
-        if self.checksum_check:
-            # TODO: Handle IPv6 here
-            tcpraw = mpkt.get_field('tcp')
+        mpkt.l4_src, \
+        mpkt.l4_dst, \
+        mpkt.l4_ack, \
+        mpkt.l4_seq, \
+        mpkt.l4_flags = mpkt.get_fields('tcp', ('sport', 'dport', 'ack', \
+                                                'seq', 'flags'))
+        mpkt.l4_len = mpkt.get_field('tcp.dataofs', 5) * 4
 
-            if tcpraw:
-                ln = mpkt.get_field('ip.len') - 20
-
-                if ln == len(tcpraw):
-                    ip_src = mpkt.get_field('ip.src')
-                    ip_dst = mpkt.get_field('ip.dst')
-
-                    psdhdr = pack("!4s4sHH",
-                                  inet_aton(ip_src),
-                                  inet_aton(ip_dst),
-                                  mpkt.get_field('ip.proto'),
-                                  ln)
-
-                    chksum = checksum(psdhdr + tcpraw[:16] + \
-                                      "\x00\x00" + tcpraw[18:])
-
-                    if mpkt.get_field('tcp.chksum', 0) != chksum:
-                        mpkt.set_cfield('good_checksum', hex(chksum))
-                        self.manager.user_msg(
-                                    _("Invalid TCP packet from %s to %s : " \
-                                      "wrong checksum %s instead of %s") %  \
-                                    (ip_src, ip_dst,                        \
-                                     hex(mpkt.get_field('tcp.chksum', 0)),  \
-                                     hex(chksum)),
-                                    5, 'decoder.tcp')
-                    elif self.reassembler:
-                        self.reassembler.process_tcp(mpkt)
-
-        if not self.dissectors:
+        if mpkt.l4_src is None:
             return None
 
-        ret = self.manager.run_decoder(APP_LAYER_TCP,
-                                 mpkt.get_field('tcp.dport'), mpkt)
+        tcpraw = mpkt.get_field('tcp')
 
-        ret = max(ret, self.manager.run_decoder(APP_LAYER_TCP,
-                                 mpkt.get_field('tcp.sport'), mpkt))
+        if tcpraw:
+            mpkt.data_len = mpkt.payload_len - mpkt.l4_len
+            mpkt.data = tcpraw[mpkt.l4_len:]
+
+        wrong = False
+
+        if self.checksum_check and tcpraw:
+            if mpkt.payload_len == len(tcpraw):
+                ip_src = mpkt.l3_src
+                ip_dst = mpkt.l3_dst
+
+                psdhdr = pack("!4s4sHH",
+                              inet_aton(ip_src),
+                              inet_aton(ip_dst),
+                              mpkt.l4_proto,
+                              mpkt.payload_len)
+
+                chksum = checksum(psdhdr + tcpraw[:16] + \
+                                  "\x00\x00" + tcpraw[18:])
+
+                if mpkt.get_field('tcp.chksum', 0) != chksum:
+                    wrong = True
+                    mpkt.set_cfield('good_checksum', hex(chksum))
+                    self.manager.user_msg(
+                                _("Invalid TCP packet from %s to %s : " \
+                                  "wrong checksum %s instead of %s") %  \
+                                (ip_src, ip_dst,                        \
+                                 hex(mpkt.get_field('tcp.chksum', 0)),  \
+                                 hex(chksum)),
+                                5, 'decoder.tcp')
+
+        if wrong:
+            self.manager.run_decoder(APP_LAYER, PL_DEFAULT, mpkt)
+            return None
+
+        if self.reassembler:
+            self.reassembler.process_tcp(mpkt)
+
+        ident = TCPIdent.create(mpkt)
+        sess = SessionManager().get_session(ident)
+
+        if not sess:
+            sess = Session(ident)
+            sess.data = (TCPStatus(), TCPStatus())
+            SessionManager().put_session(sess)
+
+        sess.prev = mpkt.session
+        mpkt.session = sess
+
+        if ident.l3_src == sess.ident.l3_src:
+            status = sess.data[1]
+            ostatus = sess.data[0]
+        else:
+            status = sess.data[0]
+            ostatus = sess.data[1]
+
+        status.last_seq = mpkt.l4_seq + mpkt.data_len
+
+        if mpkt.l4_flags & TH_ACK:
+            status.last_ack = mpkt.l4_ack
+
+        if mpkt.l4_flags & TH_SYN:
+            status.last_seq += 1
+
+        if mpkt.l4_flags & TH_RST:
+            status.injectable |= INJ_FIN
+            ostatus.injectable |= INJ_FIN
+
+        if mpkt.flags & MPKT_FORWARDABLE:
+            status.injectable |= INJ_FWD
+        elif status.injectable & INJ_FWD:
+            status.injectable ^= INJ_FWD
+
+        self.manager.run_decoder(APP_LAYER, PL_DEFAULT, mpkt)
+
+        if mpkt.l4_flags & TH_FIN:
+            status.injectable |= INJ_FIN
+
+        if mpkt.flags & MPKT_DROPPED and mpkt.flags & MPKT_FORWARDABLE:
+            status.seq_adj += mpkt.inj_delta
+        elif (mpkt.flags & MPKT_MODIFIED or \
+             status.seq_adj != 0 or ostatus != 0) and \
+             mpkt.flags & MPKT_FORWARDABLE:
+
+            mpkt.set_field('tcp.seq', mpkt.l4_seq + status.seq_adj)
+            mpkt.set_field('tcp.ack', mpkt.l4_ack - ostatus.seq_adj)
+
+            status.seq_adj += mpkt.inj_delta
+
+            mpkt.set_field('tcp.chksum', None)
 
         return None
 
@@ -1104,7 +1042,6 @@ __protocols__   = (('tcp', None), )
 __configurations__ = (
     ('decoder.tcp', {
         'checksum_check' : [True, 'Cheksum check for TCP segments'],
-        'enable_dissectors' : [True, 'Enable TCP protocol dissectors'],
         'enable_reassemble' : [True, 'Enable userland python implementation of '
                                'TCP/IP stack to tracks TCP streams connection. '
                                'You\'ve to enable checksum_check'],
